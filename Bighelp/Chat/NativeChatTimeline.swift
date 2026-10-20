@@ -98,12 +98,23 @@ enum ChatCanvasRow: Identifiable, Equatable {
 enum ChatCanvasTranscriptProjection {
     static func rows(from displayRows: [ChatTurnDisplayRow], disclosures: ChatActivityDisclosureStore,
                      isSending: Bool = false, readsAgentMessages: Bool = true) -> [ChatCanvasRow] {
+        rows(from: displayRows[...], disclosures: disclosures, isSending: isSending,
+             tailEntryID: tailEntryID(of: displayRows[...], isSending: isSending),
+             talk: ChatAgentTalkIndex(displayRows, readsAgentMessages: readsAgentMessages))
+    }
+
+    /// While a turn runs, the folder at its tail is the work in progress:
+    /// the agent hasn't moved on to text, thinking or another folder yet.
+    static func tailEntryID(of displayRows: ArraySlice<ChatTurnDisplayRow>, isSending: Bool) -> String? {
+        guard isSending, case .entry(let entry)? = displayRows.last, case .activity = entry else { return nil }
+        return entry.id
+    }
+
+    /// `rows(from:…)` for some of the display rows (`ChatTranscriptCanvasCache` projects a turn at
+    /// a time), with the chat's tail and agent talk worked out from all of them.
+    static func rows(from displayRows: ArraySlice<ChatTurnDisplayRow>, disclosures: ChatActivityDisclosureStore,
+                     isSending: Bool, tailEntryID: String?, talk: ChatAgentTalkIndex) -> [ChatCanvasRow] {
         var result: [ChatCanvasRow] = []
-        // While a turn runs, the folder at its tail is the work in progress:
-        // the agent hasn't moved on to text, thinking or another folder yet.
-        var tailEntryID: String?
-        if isSending, case .entry(let entry)? = displayRows.last, case .activity = entry { tailEntryID = entry.id }
-        let talk = ChatAgentTalkIndex(displayRows, readsAgentMessages: readsAgentMessages)
         func appendTalk(_ piece: ChatAgentTalk.Piece) {
             // Messages back to back read as one exchange.
             if case .agentTalk(var previous)? = result.last {
@@ -370,7 +381,10 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
             self.row = row
             self.render = render
             self.generation = generation
+            ChatPerformanceProbe.live("live.hosted-row", 1)
         }
+
+        deinit { ChatPerformanceProbe.live("live.hosted-row", -1) }
     }
 
     private struct HostedRow: View {
@@ -381,6 +395,7 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
             // message here (rather than in the UIKit configuration closure)
             // keeps pending state, mode changes and sender stores live even
             // when the transcript item's value itself has not changed.
+            let _ = ChatPerformanceProbe.count("row.body")
             state.render(state.row).id(state.row.id)
         }
     }
@@ -389,6 +404,7 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
     final class Coordinator: NSObject, UITableViewDelegate {
         weak var controller: ChatTimelineController?
         private var dataSource: UITableViewDiffableDataSource<Int, String>!
+        private var rows: [ChatCanvasRow] = []
         private var rowsByID: [String: ChatCanvasRow] = [:]
         private var orderedIDs: [String] = []
         private var conversationID: String?
@@ -446,6 +462,9 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
         }
         private var style: Style?
         private var heights: [String: (width: CGFloat, height: CGFloat)] = [:]
+        /// UIKit asks every row's estimate whenever rows are added; working each out from its
+        /// text again made each new row of a long chat cost as much as reading the whole chat.
+        private var estimates: [String: (width: CGFloat, height: CGFloat)] = [:]
         private var publicationPending = false
         private var presentationGeneration = 0
         private var pendingUpdate: (parent: NativeChatTimeline, environment: EnvironmentValues)?
@@ -477,7 +496,9 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
                 self.updateScheduled = false
                 guard let table, let update = self.pendingUpdate else { return }
                 self.pendingUpdate = nil
-                self.update(update.parent, environment: update.environment, table: table)
+                ChatPerformanceProbe.measure("timeline.update") {
+                    self.update(update.parent, environment: update.environment, table: table)
+                }
                 table.applyCustomContentInsets(update.parent.contentInsets)
                 table.accessibilityValue = "\(update.parent.entryCount) conversation entries"
             }
@@ -488,6 +509,7 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
         }
 
         private func configure(_ cell: UITableViewCell, id: String) {
+            ChatPerformanceProbe.count("row.configure")
             guard let row = rowsByID[id], let rowContent else { return }
             if let state = hostedRows.object(forKey: cell), state.row.id == id,
                state.generation == presentationGeneration {
@@ -543,21 +565,55 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
                 table.followsTail = true
                 table.isAnimatingReturn = false
                 heights.removeAll()
+                estimates.removeAll()
                 hostedRows.removeAllObjects()
             }
+            // A long chat changes at its tail (a growing answer, a new tool). Only the rows
+            // between the unchanged ends are looked at: hashing and comparing every row of
+            // the history on each update made a long chat's streaming stutter.
+            let previous = rows
+            let next = parent.rows
+            rows = next
+            let shorter = min(previous.count, next.count)
+            var start = 0
+            while start < shorter, previous[start] == next[start] { start += 1 }
+            var end = 0
+            while end < shorter - start, previous[previous.count - 1 - end] == next[next.count - 1 - end] { end += 1 }
+            let removed = previous[start..<(previous.count - end)]
+            let inserted = next[start..<(next.count - end)]
+            guard reset || styleChanged || !removed.isEmpty || !inserted.isEmpty else {
+                table.setNeedsLayout()
+                return
+            }
             let previousRows = rowsByID
-            rowsByID = Dictionary(uniqueKeysWithValues: parent.rows.map { ($0.id, $0) })
-            let ids = parent.rows.map(\.id)
+            if reset {
+                rowsByID = Dictionary(uniqueKeysWithValues: next.map { ($0.id, $0) })
+            } else {
+                for row in removed { rowsByID[row.id] = nil }
+                for row in inserted { rowsByID[row.id] = row }
+            }
+            let insertedIDs = inserted.map(\.id)
+            let reordered = reset || !removed.map(\.id).elementsEqual(insertedIDs)
+            let ids = reordered
+                ? Array(orderedIDs.prefix(start)) + insertedIDs + Array(orderedIDs.suffix(end))
+                : orderedIDs
             let previousFirstID = orderedIDs.first
             if reset || styleChanged || previousFirstID != ids.first {
                 presentationGeneration &+= 1
             }
-            let changed = ids.filter {
-                styleChanged || previousRows[$0] != rowsByID[$0]
-                    || (previousFirstID != ids.first && ($0 == previousFirstID || $0 == ids.first))
+            var changed = styleChanged ? ids : insertedIDs.filter { previousRows[$0] != rowsByID[$0] }
+            if !styleChanged, previousFirstID != ids.first {
+                // The first row's top padding moves to the new first row.
+                for id in [previousFirstID, ids.first].compactMap({ $0 })
+                where rowsByID[id] != nil && !changed.contains(id) {
+                    changed.append(id)
+                }
             }
-            for id in changed { heights[id] = nil }
-            if ids != orderedIDs || reset {
+            for id in changed {
+                heights[id] = nil
+                estimates[id] = nil
+            }
+            if reordered {
                 orderedIDs = ids
                 heights = heights.filter { rowsByID[$0.key] != nil }
                 var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
@@ -584,6 +640,7 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
             } else {
                 // Unchanged history keeps its hosting views, text selection and
                 // measured layout. Offscreen changes are rendered on reuse.
+                let changed = Set(changed)
                 for index in table.indexPathsForVisibleRows ?? [] {
                     let id = ids[index.row]
                     if changed.contains(id), let cell = table.cellForRow(at: index) {
@@ -629,7 +686,15 @@ struct NativeChatTimeline<Content: View>: UIViewRepresentable {
         func tableView(_ tableView: UITableView, estimatedHeightForRowAt indexPath: IndexPath) -> CGFloat {
             guard orderedIDs.indices.contains(indexPath.row) else { return 120 }
             let id = orderedIDs[indexPath.row]
-            if let measurement = heights[id], measurement.width == tableView.bounds.width { return measurement.height }
+            let width = tableView.bounds.width
+            if let measurement = heights[id], measurement.width == width { return measurement.height }
+            if let estimate = estimates[id], estimate.width == width { return estimate.height }
+            let estimate = estimatedHeight(id: id, in: tableView)
+            estimates[id] = (width, estimate)
+            return estimate
+        }
+
+        private func estimatedHeight(id: String, in tableView: UITableView) -> CGFloat {
             // A uniform 120-point estimate makes a tall streamed message look
             // like several short rows, provoking speculative sizing around
             // every tail insertion. These are estimates only; UIKit measures
