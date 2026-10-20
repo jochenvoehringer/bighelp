@@ -1018,7 +1018,8 @@ struct ChatView: View {
             }
             thisChatMenu
             if dynamicTypeSize.isAccessibilitySize {
-                if projectChangesSummary != nil || offersContextWindow || providerUsage?.isAvailable == true || nerdModeEnabled {
+                if projectChangesSummary != nil || canCompact || offersContextWindow
+                    || providerUsage?.isAvailable == true || nerdModeEnabled {
                     Menu {
                         fileChangesMenuItem
                         usageMenu
@@ -1139,7 +1140,7 @@ struct ChatView: View {
         }
     }
 
-    /// Advanced › Compact: Hermes folds earlier messages into a summary; the rail above
+    /// Usage › Compact: Hermes folds earlier messages into a summary; the rail above
     /// the message box shows it working, then what it saved.
     private func compactChat(_ client: any CompactingConversationClient) {
         Task {
@@ -1174,10 +1175,11 @@ struct ChatView: View {
 
     @ViewBuilder
     private var usageMenu: some View {
-        if offersContextWindow || providerUsage?.isAvailable == true {
+        if offersContextWindow || providerUsage?.isAvailable == true || canCompact {
             Menu {
                 providerUsageMenuItem
                 contextWindowMenuItem
+                compactMenuItem
             } label: {
                 Label("Usage", systemImage: "gauge.with.dots.needle.50percent")
             }
@@ -1185,18 +1187,26 @@ struct ChatView: View {
         }
     }
 
+    private var canCompact: Bool { model.client is any CompactingConversationClient }
+
+    /// Beside the context window it frees, and an everyday action, so it never
+    /// waits for Nerd Mode: Nerd Mode is kept per device, and a new install has it off.
+    @ViewBuilder
+    private var compactMenuItem: some View {
+        if let compacting = model.client as? any CompactingConversationClient {
+            Button("Compact", systemImage: "arrow.down.right.and.arrow.up.left") {
+                dismissKeyboard()
+                compactChat(compacting)
+            }
+            .disabled(model.isSending || model.compaction != nil)
+            .accessibilityIdentifier("chat.compact")
+        }
+    }
+
     @ViewBuilder
     private var advancedMenu: some View {
         if nerdModeEnabled {
             Menu {
-                if let compacting = model.client as? any CompactingConversationClient {
-                    Button("Compact", systemImage: "arrow.down.right.and.arrow.up.left") {
-                        dismissKeyboard()
-                        compactChat(compacting)
-                    }
-                    .disabled(model.isSending || model.compaction != nil)
-                    .accessibilityIdentifier("chat.compact")
-                }
                 if dynamicTypeSize.isAccessibilitySize {
                     Menu {
                         displayMenuItems
