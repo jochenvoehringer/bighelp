@@ -100,7 +100,7 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
     }
     /// Evidence is distinct from a REST row, restored draft, or live status.
     /// It is never persisted across workspace/connection ownership boundaries.
-    private struct RuntimeOwnership {
+    struct RuntimeOwnership {
         let revision = UUID()
         let runtimeID: String
         let sessionKey: String
@@ -112,7 +112,7 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
         let item: DirectHermesActiveSessionItem
         let ownership: RuntimeOwnership
     }
-    private struct Binding {
+    struct Binding {
         var coordinate: WorkspaceSessionCoordinate
         let anchorID: String
         var record: SessionRecord
@@ -145,6 +145,8 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
     private var retired = false
     private var profiles: [String: Profile] = [:]
     private var bindings: [String: Binding] = [:]
+    private var bindingsVersion = 0
+    private var anchorIndexCache: (version: Int, index: BindingAnchorIndex)?
     private var canonicalIDs: [String: Registry] = [:]
     private var creations: [String: DirectHermesSessionCreationState] = [:]
     private var creatingProfiles: Set<String> = []
@@ -397,14 +399,16 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
         guard listToken == token else { throw CancellationError() }
         if ownershipRevision != ownershipTicket { discovered = nil }
         var committed: [String: Binding] = [:]
-        let savedOrder = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.id, $0.offset) })
+        let savedRecords = records
         records = []
         for profile in loaded {
-            var rows = pending.values.filter {
-                DirectHermesSessionValidation.same($0.coordinate.profileID, profile.id)
+            // The records already follow REST order. Reuse it instead of sorting
+            // thousands of dictionary entries again on the main actor.
+            var rows = savedRecords.compactMap { record -> Binding? in
+                guard let row = pending[record.id],
+                      DirectHermesSessionValidation.same(row.coordinate.profileID, profile.id) else { return nil }
+                return row
             }
-            // Preserve REST order (dictionary iteration must not reorder rows).
-            rows.sort { (savedOrder[$0.record.id] ?? Int.max) < (savedOrder[$1.record.id] ?? Int.max) }
             if let discovered {
                 rows = rows.map(removingLiveBinding)
                 let savedRows = rows
@@ -1297,14 +1301,6 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
         return flag(row["archived"]) && !flag(row["auto_archived"])
     }
 
-    private func identityKeys(_ binding: Binding) -> Set<String> {
-        var ids = [binding.anchorID]
-        ids += [binding.coordinate.storedSessionID, binding.runtimeSessionKey, binding.canonicalRegistryID,
-                binding.catalog?.rowID, binding.catalog?.lineageRootID].compactMap { $0 }
-        ids += binding.catalog?.lineageIDs ?? []
-        return Set(ids.map(DirectHermesSessionIdentity.key))
-    }
-
     func setFlags(_ record: SessionRecord, flags: DirectHermesSessionFlags) async throws {
         let binding = try candidate(for: record)
         guard binding.durability == .persisted else { throw DirectHermesSessionError.sessionNotPersisted }
@@ -1623,13 +1619,12 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
         _ incoming: Binding,
         claimedRetainedVisibleIDs: inout Set<String>
     ) throws -> Binding {
-        let matches = bindings.values.filter { current in
+        let matches = anchorIndex().bindings(anchoredIn: storedIdentities(of: incoming)).filter { current in
             current.record.id != incoming.record.id
                 && DirectHermesSessionValidation.same(
                     current.coordinate.profileID,
                     incoming.coordinate.profileID
                 )
-                && binding(incoming, containsStoredIdentity: current.anchorID)
         }
         guard matches.count <= 1 else { throw WorkspaceClientError.invalidResponse }
         guard let current = matches.first else { return incoming }
@@ -1684,11 +1679,13 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
         var value = original
         // All coordinates are validated at construction; removing the optional
         // runtime cannot invalidate any of their unchanged stored fields.
-        value.coordinate = try! .init(owner: original.coordinate.owner,
-                                      profileID: original.coordinate.profileID,
-                                      sessionID: original.coordinate.sessionID,
-                                      storedSessionID: original.coordinate.storedSessionID,
-                                      runtimeSessionID: nil)
+        if original.coordinate.runtimeSessionID != nil {
+            value.coordinate = try! .init(owner: original.coordinate.owner,
+                                          profileID: original.coordinate.profileID,
+                                          sessionID: original.coordinate.sessionID,
+                                          storedSessionID: original.coordinate.storedSessionID,
+                                          runtimeSessionID: nil)
+        }
         value.runtimeSessionKey = nil
         value.ownership = nil
         value.record.isActive = false
@@ -1704,6 +1701,8 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
             ownershipRevision = UUID()
         }
         bindings[id] = binding
+        bindingsVersion += 1
+        anchorIndexCache = nil
     }
 
     private func setBindings(_ next: [String: Binding]) {
@@ -1714,6 +1713,17 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
             ownershipRevision = UUID()
         }
         bindings = next
+        bindingsVersion += 1
+        anchorIndexCache = nil
+    }
+
+    /// Thousands of saved rows made the per-row lineage match quadratic; the index is
+    /// rebuilt only after the bindings change.
+    private func anchorIndex() -> BindingAnchorIndex {
+        if let cache = anchorIndexCache, cache.version == bindingsVersion { return cache.index }
+        let index = BindingAnchorIndex(bindings.values)
+        anchorIndexCache = (bindingsVersion, index)
+        return index
     }
 
     private func observeReplayEpoch(_ epoch: String) {
@@ -1992,25 +2002,6 @@ final class DirectHermesSessionCatalogClient: SessionCatalogClient {
                 ownership: owned.ownership
             ))
         }
-    }
-
-    private func binding(_ binding: Binding, containsStoredIdentity value: String) -> Bool {
-        DirectHermesSessionValidation.same(binding.anchorID, value)
-            || binding.coordinate.storedSessionID.map {
-                DirectHermesSessionValidation.same($0, value)
-            } == true
-            || binding.catalog.map {
-                DirectHermesSessionValidation.same($0.rowID, value)
-            } == true
-            || binding.catalog?.lineageRootID.map {
-                DirectHermesSessionValidation.same($0, value)
-            } == true
-            || binding.catalog?.lineageIDs?.contains(where: {
-                DirectHermesSessionValidation.same($0, value)
-            }) == true
-            || binding.catalog?.canonicalRegistryID.map {
-                DirectHermesSessionValidation.same($0, value)
-            } == true
     }
 
     /// Resolve the session's persisted cwd through Hermes' project registry.
