@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Discovers only the selected host's configured workspace before mounting the
+/// Discovers only the selected agent's configured workspace before mounting the
 /// existing confined artifact browser. No default or user-authored root is used.
 @MainActor
 struct ConfiguredWorkspaceArtifactsView: View {
@@ -9,6 +9,7 @@ struct ConfiguredWorkspaceArtifactsView: View {
     let http: any DirectHermesNativeHTTP & DirectHermesAuthenticatedHTTP
     let performer: any WorkspaceOperationPerforming
     let currentOwner: @MainActor () -> WorkspaceOwner?
+    var agentID: String? = nil
     var isEmbedded = false
     /// Offered when Hermes can't find the agent's folder.
     var folderChooser: WorkspaceFolderChooser?
@@ -76,13 +77,14 @@ struct ConfiguredWorkspaceArtifactsView: View {
         errorMessage = nil
         defer { isLoading = false }
         do {
-            let client = DirectHermesManagedFilesClient(http: http, owner: owner, currentOwner: currentOwner)
+            let client = DirectHermesManagedFilesClient(http: http, owner: owner, agentID: agentID,
+                currentOwner: currentOwner)
             let verified = try await client.workspaceScope()
             try Task.checkCancellation()
             guard currentOwner() == owner, verified.owner == owner else { return }
             scopeClient = client
             artifactClient = DirectHermesArtifactClient(http: http, owner: owner,
-                fallback: performer, currentOwner: currentOwner)
+                fallback: performer, agentID: agentID, currentOwner: currentOwner)
             scope = verified
         } catch is CancellationError {
         } catch {

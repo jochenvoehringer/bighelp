@@ -495,7 +495,7 @@ extension RootShellView {
     /// Picks the agent's workspace folder when Hermes can't find one: the profile Files reads from.
     func workspaceFolderChooser(owner: WorkspaceOwner) -> WorkspaceFolderChooser? {
         guard let client = workspaceConnections?.workspace as? DirectHermesWorkspaceClient,
-              let profile = client.nativeContext?.servingProfileID ?? homeAgent?.id
+              let profile = homeAgent?.id ?? client.nativeContext?.servingProfileID
         else { return nil }
         return .live(client: client, owner: owner, profileID: profile)
     }
@@ -504,12 +504,17 @@ extension RootShellView {
     var appsArtifacts: some View {
         if let owner = currentWorkspaceOwner, let performer = workspaceConnections?.workspace,
            let direct = workspaceConnections?.hosts.selectedWorkspace?.nativeClient {
+            let agentID = homeAgent?.id
             ConfiguredWorkspaceArtifactsView(
                 hostName: workspaceHostName, owner: owner, http: direct, performer: performer,
-                currentOwner: { workspaceConnections?.workspace === performer ? currentWorkspaceOwner : nil },
-                isEmbedded: true, folderChooser: workspaceFolderChooser(owner: owner)
+                currentOwner: {
+                    guard workspaceConnections?.workspace === performer, homeAgent?.id == agentID else { return nil }
+                    return currentWorkspaceOwner
+                },
+                agentID: agentID, isEmbedded: true, folderChooser: workspaceFolderChooser(owner: owner)
             )
             .id(owner)
+            .id(agentID)
         } else {
             ContentUnavailableView("No artifacts yet", systemImage: "square.on.circle",
                 description: Text("Files, pages and apps your agent makes show up here."))
